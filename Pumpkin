@@ -1,0 +1,867 @@
+--[[
+    PUMPKIN AUTO-COLLECTOR — Minimal Toggle UI (v5.2 beside-teleport)
+    ─────────────────────────────────────────────────────────────────
+    Same 220×62 widget. Single switch.
+
+    Key change: character teleports BESIDE the pumpkin (3-6 studs out),
+    not on top of it. The prompt then appears naturally within its own
+    MaxActivationDistance and fires cleanly.
+
+    • Stand distance = pumpkin radius + 3 studs (clamped inside prompt range)
+    • Ground raycast ensures you land on a valid surface
+    • Character faces the pumpkin (camera naturally shows prompt)
+    • 8 stand directions — rotated on each retry (handles walls/corners)
+    • No prompt property mutation — pure natural trigger
+    • Per-pumpkin blacklist after 3 failed attempts
+    • Auto-resumes after death/respawn
+
+    Requirements:
+      • Executor with fireproximityprompt (preferred) OR
+      • Executor with fireclickdetector (for ClickDetector pumpkins)
+      • Falls back to InputHoldBegin/End if neither exists
+]]
+
+print("[PumpkinAutoCollector v5.2] Loading...")
+
+local bootOK, bootErr = pcall(function()
+
+local Players     = game:GetService("Players")
+local UIS         = game:GetService("UserInputService")
+local TweenService= game:GetService("TweenService")
+local Me          = Players.LocalPlayer
+local PlayerGui   = Me:WaitForChild("PlayerGui", 20)
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
+local CONFIG = {
+    pumpkinPatterns = { "pumpkin", "pumkin", "jacko", "jack_o", "jack-o", "gourd" },
+    promptPatterns  = { "collect", "grab", "pick", "harvest", "take", "pumpkin" },
+
+    -- Stand distance from pumpkin CENTER, in studs
+    standDistMin    = 3,        -- never closer than this
+    standDistFactor = 0.6,      -- percent of prompt MaxActivationDistance
+    standDistBuffer = 3,        -- extra studs beyond pumpkin radius
+    groundOffset    = 3,        -- HRP sits this far above ground
+
+    settleTime      = 0.30,
+    postFireWait    = 0.60,
+    delayBetween    = 0.7,
+    maxRetries      = 2,
+    scanInterval    = 3,
+    batchSize       = 500,
+}
+
+-- ============================================================
+-- STATE
+-- ============================================================
+local found          = {}
+local foundOrder     = {}
+local collectedCount = 0
+local failedAttempts = {}
+local attemptOffsets = {}
+local blacklist      = {}
+local automating     = false
+local running        = true
+local scanBusy       = false
+local collectBusy    = false
+local connections    = {}
+local HAS_FIRE_PROMPT = (type(fireproximityprompt) == "function")
+local HAS_FIRE_CLICK  = (type(fireclickdetector) == "function")
+
+local function w(t) return (task and task.wait or wait)(t) end
+local function sp(fn, ...) return (task and task.spawn or coroutine.wrap)(fn, ...) end
+local function connect(sig, fn)
+    local c = sig:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+local function disconnectAll()
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    table.clear(connections)
+end
+
+-- ============================================================
+-- HELPERS
+-- ============================================================
+local function pathOf(inst)
+    local parts, cur = {}, inst
+    while cur and cur ~= game do
+        table.insert(parts, 1, cur.Name)
+        cur = cur.Parent
+        if #parts > 12 then break end
+    end
+    return table.concat(parts, " > ")
+end
+local function getPosition(inst)
+    if not inst or not inst.Parent then return nil end
+    if inst:IsA("BasePart") then return inst.Position end
+    if inst:IsA("Model") then
+        local ok, cf = pcall(function() return inst:GetModelCFrame() end)
+        if ok and cf then return cf.Position end
+        if inst.PrimaryPart then return inst.PrimaryPart.Position end
+    end
+    return nil
+end
+local function isInCamera(inst)
+    local cur = inst
+    while cur and cur ~= game do
+        if cur:IsA("Camera") then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+local function isInPlayerOrTool(inst)
+    local cur = inst.Parent
+    while cur and cur ~= workspace do
+        if cur:IsA("Tool") or cur:IsA("Accessory") then return true end
+        if cur:IsA("Model") and cur:FindFirstChildOfClass("Humanoid") then return true end
+        cur = cur.Parent
+    end
+    return false
+end
+local function nameMatchesPumpkin(name)
+    local lower = name:lower()
+    for _, pat in ipairs(CONFIG.pumpkinPatterns) do
+        if lower:find(pat, 1, true) then return pat end
+    end
+    return nil
+end
+local function ancestorPumpkinFolder(inst)
+    local cur = inst.Parent
+    local depth = 0
+    while cur and cur ~= workspace and depth < 10 do
+        local pat = nameMatchesPumpkin(cur.Name)
+        if pat then return cur, pat end
+        cur = cur.Parent
+        depth = depth + 1
+    end
+    return nil, nil
+end
+local function findActivePrompt(inst)
+    local function check(p)
+        if not p or not p:IsA("ProximityPrompt") then return nil end
+        if p.Enabled == false then return nil end
+        local text = ((p.ActionText or "") .. " " .. (p.ObjectText or "")):lower()
+        for _, pat in ipairs(CONFIG.promptPatterns) do
+            if text:find(pat, 1, true) then return p end
+        end
+        return nil
+    end
+    local self = check(inst:FindFirstChildOfClass("ProximityPrompt"))
+    if self then return self end
+    for _, d in ipairs(inst:GetDescendants()) do
+        local p = check(d)
+        if p then return p end
+    end
+    return nil
+end
+local function findClickDetector(inst)
+    local cd = inst:FindFirstChildOfClass("ClickDetector")
+    if cd and cd.Enabled ~= false then return cd end
+    if inst:IsA("Model") or inst:IsA("Folder") then
+        for _, d in ipairs(inst:GetDescendants()) do
+            if d:IsA("ClickDetector") and d.Enabled ~= false then return d end
+        end
+    end
+    return nil
+end
+
+-- ============================================================
+-- PUMPKIN BOUNDS (position + size for stand distance)
+-- ============================================================
+local function getPumpkinBounds(inst)
+    if not inst or not inst.Parent then return nil, nil end
+    if inst:IsA("BasePart") then
+        return inst.Position, inst.Size
+    elseif inst:IsA("Model") then
+        local ok, cf, sz = pcall(function() return inst:GetBoundingBox() end)
+        if ok and cf then return cf.Position, sz end
+        return getPosition(inst), Vector3.new(2, 2, 2)
+    end
+    return getPosition(inst), Vector3.new(2, 2, 2)
+end
+
+-- ============================================================
+-- SCANNER
+-- ============================================================
+local function processCandidate(inst)
+    if not inst or not inst.Parent then return end
+    if not inst:IsDescendantOf(workspace) then return end
+    if isInCamera(inst) or isInPlayerOrTool(inst) then return end
+
+    local instPat  = nameMatchesPumpkin(inst.Name)
+    local folder   = ancestorPumpkinFolder(inst)
+    local prompt   = findActivePrompt(inst)
+    local hasClick = findClickDetector(inst) ~= nil
+    local isActive = prompt ~= nil or hasClick
+
+    if not isActive then return end
+    if not (instPat or folder or nameMatchesPumpkin(
+        (prompt and prompt.Parent and prompt.Parent.Name) or "")) then return end
+
+    local logTarget = inst
+    if prompt and prompt.Parent and prompt.Parent ~= inst then
+        logTarget = prompt.Parent
+    end
+
+    if found[logTarget] then
+        found[logTarget].isActive = isActive
+        return
+    end
+
+    local cur = logTarget.Parent
+    while cur and cur ~= workspace do
+        if found[cur] then return end
+        cur = cur.Parent
+    end
+
+    local pos = getPosition(logTarget)
+    local record = {
+        instance  = logTarget,
+        path      = pathOf(logTarget),
+        position  = pos,
+        isActive  = isActive,
+        hasPrompt = prompt ~= nil,
+        hasClick  = hasClick,
+    }
+    found[logTarget] = record
+    table.insert(foundOrder, record)
+end
+
+local function fullScan()
+    if scanBusy or not running then return end
+    scanBusy = true
+    sp(function()
+        local descendants
+        local ok = pcall(function() descendants = workspace:GetDescendants() end)
+        if not ok then scanBusy = false; return end
+        for i = 1, #descendants do
+            if not running then break end
+            pcall(processCandidate, descendants[i])
+            if i % CONFIG.batchSize == 0 then w() end
+        end
+        scanBusy = false
+    end)
+end
+
+-- ============================================================
+-- CHARACTER + GROUND HELPERS
+-- ============================================================
+local function getLocalCharacter()
+    local char = Me.Character
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hum or not hrp or hum.Health <= 0 then return nil end
+    if hum.Sit or hum.SeatPart or hum.PlatformStand then return nil end
+    return char, hum, hrp
+end
+
+local function findGroundBelow(worldPos, character)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local start = worldPos + Vector3.new(0, 30, 0)
+    local hit = workspace:Raycast(start, Vector3.new(0, -80, 0), params)
+    if hit then return hit.Position end
+    return nil
+end
+
+-- ============================================================
+-- STAND DISTANCE / POSITION
+-- ============================================================
+local STAND_DIRECTIONS = {
+    Vector3.new(1, 0, 0),
+    Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1),
+    Vector3.new(0, 0, -1),
+    Vector3.new(0.707, 0, 0.707),
+    Vector3.new(-0.707, 0, 0.707),
+    Vector3.new(0.707, 0, -0.707),
+    Vector3.new(-0.707, 0, -0.707),
+}
+
+local function computeStandDistance(prompt, pumpkinSize)
+    local maxAct = 10
+    if prompt then
+        pcall(function() maxAct = prompt.MaxActivationDistance or 10 end)
+    end
+    if not maxAct or maxAct < 2 then maxAct = 10 end
+
+    local pumpkinRadius = math.max(pumpkinSize.X, pumpkinSize.Z) / 2
+
+    if pumpkinRadius + 1 < maxAct * 0.9 then
+        -- Stand outside pumpkin, within activation range
+        local preferred = pumpkinRadius + CONFIG.standDistBuffer
+        local maxAllowed = maxAct * 0.85
+        return math.max(CONFIG.standDistMin, math.min(preferred, maxAllowed))
+    else
+        -- Pumpkin is nearly as big as the prompt's range → prioritize range
+        return math.max(1.5, maxAct * 0.7)
+    end
+end
+
+local function computeStandPosition(pumpkinPos, pumpkinSize, prompt, character, directionIndex)
+    local dist = computeStandDistance(prompt, pumpkinSize)
+    local dir = STAND_DIRECTIONS[((directionIndex - 1) % #STAND_DIRECTIONS) + 1]
+    local targetXZ = pumpkinPos + Vector3.new(dir.X, 0, dir.Z) * dist
+
+    local ground = findGroundBelow(targetXZ, character)
+    if ground then
+        return Vector3.new(ground.X, ground.Y + CONFIG.groundOffset, ground.Z)
+    end
+    return Vector3.new(targetXZ.X, pumpkinPos.Y + CONFIG.groundOffset, targetXZ.Z)
+end
+
+local function teleportBeside(inst, pumpkinPos, pumpkinSize, prompt)
+    local char, _, hrp = getLocalCharacter()
+    if not hrp then return false end
+
+    local idx = (attemptOffsets[inst] or 0) + 1
+    attemptOffsets[inst] = idx
+
+    local standPos = computeStandPosition(pumpkinPos, pumpkinSize, prompt, char, idx)
+    local lookAt = Vector3.new(pumpkinPos.X, standPos.Y, pumpkinPos.Z)
+
+    local ok = pcall(function()
+        hrp.CFrame = CFrame.lookAt(standPos, lookAt)
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+    return ok
+end
+
+local function promptDistance(prompt)
+    if not prompt or not prompt.Parent then return nil end
+    local _, _, hrp = getLocalCharacter()
+    if not hrp then return nil end
+    local parent = prompt.Parent
+    local ppos
+    if parent:IsA("BasePart") then ppos = parent.Position
+    elseif parent:IsA("Model") then ppos = getPosition(parent)
+    elseif parent:IsA("Attachment") then ppos = parent.WorldPosition end
+    if not ppos then return nil end
+    return (ppos - hrp.Position).Magnitude
+end
+
+-- ============================================================
+-- FIRE (natural, no property boost)
+-- ============================================================
+local function firePrompt(prompt)
+    if not prompt or not prompt.Parent then return false end
+    if HAS_FIRE_PROMPT then
+        for i = 1, 3 do
+            local ok = pcall(fireproximityprompt, prompt)
+            if ok then return true end
+            w(0.04)
+        end
+    end
+    pcall(function()
+        prompt:InputHoldBegin()
+        w(math.max(0.05, tonumber(prompt.HoldDuration) or 0.1))
+        prompt:InputHoldEnd()
+    end)
+    return true
+end
+
+local function fireClick(cd)
+    if not cd or not cd.Parent then return false end
+    if HAS_FIRE_CLICK then
+        for i = 1, 3 do
+            local ok = pcall(fireclickdetector, cd)
+            if ok then return true end
+            w(0.04)
+        end
+    end
+    return false
+end
+
+-- ============================================================
+-- COLLECT ONE
+-- ============================================================
+local function collectOne(rec)
+    local inst = rec.instance
+    if not inst or not inst.Parent then return false, "gone", false end
+
+    local pumpkinPos, pumpkinSize = getPumpkinBounds(inst)
+    if not pumpkinPos then return false, "no position", true end
+    if not pumpkinSize then pumpkinSize = Vector3.new(2, 2, 2) end
+
+    local prompt = findActivePrompt(inst)
+    local cd = findClickDetector(inst)
+    if not prompt and not cd then
+        return true, "already gone", false
+    end
+
+    -- Teleport beside pumpkin
+    if not teleportBeside(inst, pumpkinPos, pumpkinSize, prompt) then
+        return false, "no character", true
+    end
+    w(CONFIG.settleTime)
+
+    -- Re-check after landing
+    prompt = findActivePrompt(inst)
+    cd = findClickDetector(inst)
+    if not prompt and not cd then
+        return true, "collected on arrive", false
+    end
+
+    -- Distance sanity check
+    if prompt then
+        local d = promptDistance(prompt)
+        local maxAct = 10
+        pcall(function() maxAct = prompt.MaxActivationDistance or 10 end)
+        if d and d > maxAct then
+            return false, string.format("too far (%.1f > %.1f)", d, maxAct), true
+        end
+    end
+
+    -- Fire
+    local fired = false
+    if prompt then fired = firePrompt(prompt) or fired end
+    if cd and not fired then fired = fireClick(cd) or fired end
+    if not fired then return false, "fire failed", true end
+    w(CONFIG.postFireWait)
+
+    -- Verify
+    local p2 = findActivePrompt(inst)
+    local c2 = findClickDetector(inst)
+    if not p2 and not c2 then return true, "collected", false end
+
+    -- Follow-up fire
+    if p2 then firePrompt(p2) end
+    if c2 and not p2 then fireClick(c2) end
+    w(CONFIG.postFireWait)
+    p2 = findActivePrompt(inst)
+    c2 = findClickDetector(inst)
+    if not p2 and not c2 then return true, "collected (follow-up)", false end
+
+    return false, "still active", true
+end
+
+-- ============================================================
+-- AUTO COLLECT LOOP
+-- ============================================================
+local function getSortedActiveList()
+    local char = Me.Character
+    local root = char and char:FindFirstChild("HumanoidRootPart")
+    local myPos = root and root.Position
+    local list = {}
+    for _, rec in ipairs(foundOrder) do
+        local inst = rec.instance
+        if inst and inst.Parent and rec.isActive and not blacklist[inst] then
+            local pos = getPosition(inst) or rec.position
+            if pos then
+                local d = myPos and (pos - myPos).Magnitude or 0
+                table.insert(list, {rec = rec, dist = d, pos = pos})
+            end
+        end
+    end
+    table.sort(list, function(a, b) return a.dist < b.dist end)
+    return list
+end
+
+local function autoCollectLoop()
+    if collectBusy then return end
+    collectBusy = true
+    while automating and running do
+        local char = getLocalCharacter()
+        if not char then
+            w(1)
+        else
+            local list = getSortedActiveList()
+            if #list == 0 then
+                w(1.5)
+            else
+                for _, entry in ipairs(list) do
+                    if not automating or not running then break end
+                    local rec = entry.rec
+                    local inst = rec.instance
+                    if inst and inst.Parent and rec.isActive then
+                        local ok, reason, stillActive = collectOne(rec)
+                        if ok then
+                            collectedCount += 1
+                            rec.isActive = false
+                            print(string.format("[PumpkinAuto] ✓ %s (%s) · total: %d",
+                                rec.path, reason, collectedCount))
+                        else
+                            failedAttempts[inst] = (failedAttempts[inst] or 0) + 1
+                            if failedAttempts[inst] >= CONFIG.maxRetries + 1 then
+                                blacklist[inst] = true
+                                print(string.format("[PumpkinAuto] ✗ Gave up after %d tries: %s (%s)",
+                                    failedAttempts[inst], rec.path, reason))
+                            else
+                                print(string.format("[PumpkinAuto] ✗ Retry %d/%d: %s (%s)",
+                                    failedAttempts[inst], CONFIG.maxRetries + 1,
+                                    rec.path, reason))
+                            end
+                            if not stillActive then rec.isActive = false end
+                        end
+                        w(CONFIG.delayBetween)
+                    end
+                end
+            end
+        end
+        w(0.3)
+    end
+    collectBusy = false
+end
+
+-- ============================================================
+-- TOGGLE SWITCH
+-- ============================================================
+local function createToggleSwitch(parent, size, initialState, onChanged)
+    local track = Instance.new("Frame")
+    track.Size = size
+    track.BackgroundColor3 = initialState
+        and Color3.fromRGB(60, 170, 90)
+        or  Color3.fromRGB(55, 62, 72)
+    track.BorderSizePixel = 0
+    track.Parent = parent
+    local tc = Instance.new("UICorner"); tc.CornerRadius = UDim.new(1, 0); tc.Parent = track
+
+    local knobSize = size.Y.Offset - 6
+    local knob = Instance.new("Frame")
+    knob.Size = UDim2.fromOffset(knobSize, knobSize)
+    knob.Position = initialState
+        and UDim2.new(1, -(knobSize + 3), 0.5, -(knobSize / 2))
+        or  UDim2.new(0, 3, 0.5, -(knobSize / 2))
+    knob.BackgroundColor3 = Color3.fromRGB(245, 250, 255)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    local kc = Instance.new("UICorner"); kc.CornerRadius = UDim.new(1, 0); kc.Parent = knob
+    local ks = Instance.new("UIStroke")
+    ks.Color = Color3.fromRGB(0, 0, 0); ks.Transparency = 0.85; ks.Thickness = 1
+    ks.Parent = knob
+
+    local click = Instance.new("TextButton")
+    click.Text = ""
+    click.Size = UDim2.fromScale(1, 1)
+    click.BackgroundTransparency = 1
+    click.AutoButtonColor = false
+    click.Parent = track
+
+    local state = initialState
+    local animating = false
+
+    local function setState(newState, animate)
+        if animating or state == newState then return end
+        state = newState
+        local targetPos = state
+            and UDim2.new(1, -(knobSize + 3), 0.5, -(knobSize / 2))
+            or  UDim2.new(0, 3, 0.5, -(knobSize / 2))
+        local targetColor = state
+            and Color3.fromRGB(60, 170, 90)
+            or  Color3.fromRGB(55, 62, 72)
+        if animate then
+            animating = true
+            local ti = TweenInfo.new(0.16, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+            TweenService:Create(knob,  ti, {Position = targetPos}):Play()
+            TweenService:Create(track, ti, {BackgroundColor3 = targetColor}):Play()
+            task.delay(0.17, function() animating = false end)
+        else
+            knob.Position = targetPos
+            track.BackgroundColor3 = targetColor
+        end
+        if onChanged then pcall(onChanged, state) end
+    end
+
+    click.MouseButton1Click:Connect(function() setState(not state, true) end)
+
+    return {
+        track = track,
+        setState = setState,
+        getState = function() return state end,
+    }
+end
+
+-- ============================================================
+-- UI — WIDGET
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "PumpkinAutoCollector"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.IgnoreGuiInset = true
+gui.Parent = PlayerGui
+
+local BG      = Color3.fromRGB(15, 20, 25)
+local HEAD    = Color3.fromRGB(25, 32, 40)
+local BORDER  = Color3.fromRGB(50, 65, 80)
+local AMBER   = Color3.fromRGB(255, 180, 60)
+local GREEN   = Color3.fromRGB(120, 230, 120)
+local YELLOW  = Color3.fromRGB(230, 200, 100)
+local RED     = Color3.fromRGB(200, 90, 90)
+local GREY    = Color3.fromRGB(150, 150, 150)
+local WHITE   = Color3.fromRGB(230, 235, 245)
+
+local widget = Instance.new("Frame")
+widget.Name = "Widget"
+widget.Size = UDim2.fromOffset(220, 62)
+widget.Position = UDim2.new(0, 20, 0, 100)
+widget.BackgroundColor3 = BG
+widget.BorderSizePixel = 0
+widget.Active = true
+widget.Parent = gui
+local wc = Instance.new("UICorner"); wc.CornerRadius = UDim.new(0, 12); wc.Parent = widget
+local ws = Instance.new("UIStroke"); ws.Color = BORDER; ws.Thickness = 1; ws.Parent = widget
+
+local header = Instance.new("Frame")
+header.Name = "Header"
+header.Size = UDim2.new(1, 0, 0, 28)
+header.BackgroundColor3 = HEAD
+header.BorderSizePixel = 0
+header.Parent = widget
+local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, 12); hc.Parent = header
+local hcFix = Instance.new("Frame")
+hcFix.Size = UDim2.new(1, 0, 0, 12)
+hcFix.Position = UDim2.new(0, 0, 1, -12)
+hcFix.BackgroundColor3 = HEAD
+hcFix.BorderSizePixel = 0
+hcFix.Parent = header
+
+local dot = Instance.new("Frame")
+dot.Name = "StatusDot"
+dot.Size = UDim2.fromOffset(8, 8)
+dot.Position = UDim2.new(0, 10, 0.5, -4)
+dot.BackgroundColor3 = GREY
+dot.BorderSizePixel = 0
+dot.ZIndex = 2
+dot.Parent = header
+local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(1, 0); dc.Parent = dot
+
+local title = Instance.new("TextLabel")
+title.Text = "PUMPKIN AUTO"
+title.Size = UDim2.new(1, -90, 1, 0)
+title.Position = UDim2.new(0, 24, 0, 0)
+title.BackgroundTransparency = 1
+title.TextColor3 = AMBER
+title.Font = Enum.Font.GothamBold
+title.TextSize = 11
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.ZIndex = 2
+title.Parent = header
+
+local minBtn = Instance.new("TextButton")
+minBtn.Text = "–"
+minBtn.Size = UDim2.fromOffset(22, 20)
+minBtn.Position = UDim2.new(1, -50, 0.5, -10)
+minBtn.BackgroundColor3 = Color3.fromRGB(50, 60, 70)
+minBtn.TextColor3 = WHITE
+minBtn.Font = Enum.Font.GothamBold
+minBtn.TextSize = 13
+minBtn.ZIndex = 2
+minBtn.Parent = header
+local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(0, 5); mc.Parent = minBtn
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Text = "×"
+closeBtn.Size = UDim2.fromOffset(22, 20)
+closeBtn.Position = UDim2.new(1, -26, 0.5, -10)
+closeBtn.BackgroundColor3 = RED
+closeBtn.TextColor3 = WHITE
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 13
+closeBtn.ZIndex = 2
+closeBtn.Parent = header
+local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 5); cc.Parent = closeBtn
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.new(1, 0, 1, -28)
+body.Position = UDim2.new(0, 0, 0, 28)
+body.BackgroundTransparency = 1
+body.Parent = widget
+
+local toggle = createToggleSwitch(
+    body,
+    UDim2.fromOffset(50, 24),
+    automating,
+    function(newState)
+        automating = newState
+        if newState then
+            print("[PumpkinAuto] AUTO ON — scanning + teleporting beside pumpkins")
+            sp(fullScan)
+            sp(autoCollectLoop)
+        else
+            print("[PumpkinAuto] AUTO OFF")
+        end
+    end
+)
+toggle.track.Position = UDim2.new(0, 10, 0.5, -12)
+
+local stateLabel = Instance.new("TextLabel")
+stateLabel.Text = automating and "ON" or "OFF"
+stateLabel.Size = UDim2.fromOffset(30, 20)
+stateLabel.Position = UDim2.new(0, 66, 0.5, -10)
+stateLabel.BackgroundTransparency = 1
+stateLabel.TextColor3 = automating and GREEN or GREY
+stateLabel.Font = Enum.Font.GothamBold
+stateLabel.TextSize = 11
+stateLabel.TextXAlignment = Enum.TextXAlignment.Left
+stateLabel.Parent = body
+
+local countLabel = Instance.new("TextLabel")
+countLabel.Text = "Got: 0"
+countLabel.Size = UDim2.new(1, -110, 1, 0)
+countLabel.Position = UDim2.new(0, 100, 0, 0)
+countLabel.BackgroundTransparency = 1
+countLabel.TextColor3 = WHITE
+countLabel.Font = Enum.Font.GothamBold
+countLabel.TextSize = 11
+countLabel.TextXAlignment = Enum.TextXAlignment.Right
+countLabel.Parent = body
+
+local miniDot = Instance.new("TextButton")
+miniDot.Name = "MiniDot"
+miniDot.Text = "P"
+miniDot.Size = UDim2.fromOffset(44, 44)
+miniDot.Position = UDim2.new(0, 20, 0, 100)
+miniDot.BackgroundColor3 = Color3.fromRGB(25, 32, 40)
+miniDot.TextColor3 = GREY
+miniDot.Font = Enum.Font.GothamBold
+miniDot.TextSize = 18
+miniDot.Visible = false
+miniDot.AutoButtonColor = false
+miniDot.ZIndex = 5
+miniDot.Parent = gui
+local mdc = Instance.new("UICorner"); mdc.CornerRadius = UDim.new(1, 0); mdc.Parent = miniDot
+local mds = Instance.new("UIStroke"); mds.Color = BORDER; mds.Thickness = 1.5; mds.Parent = miniDot
+
+-- Dragging
+local function makeDraggable(dragTarget, moveTarget, miniMode)
+    local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
+    local moved = false
+    dragTarget.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragInput = true, input
+            dragStart, startPos = input.Position, moveTarget.Position
+            moved = false
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local d = input.Position - dragStart
+            if d.Magnitude > 4 then moved = true end
+            if moved then
+                moveTarget.Position = UDim2.new(startPos.X.Scale,
+                    startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if input == dragInput then
+            dragging, dragInput = false, nil
+            if miniMode and not moved then
+                widget.Visible = true
+                miniDot.Visible = false
+                widget.Position = moveTarget.Position
+            end
+        end
+    end)
+end
+makeDraggable(header, widget, false)
+makeDraggable(miniDot, miniDot, true)
+
+minBtn.MouseButton1Click:Connect(function()
+    widget.Visible = false
+    miniDot.Visible = true
+    miniDot.Position = widget.Position
+end)
+closeBtn.MouseButton1Click:Connect(function()
+    running = false
+    automating = false
+    disconnectAll()
+    gui:Destroy()
+end)
+
+-- ============================================================
+-- WATCHERS
+-- ============================================================
+connect(workspace.DescendantAdded, function(inst)
+    if not running then return end
+    pcall(processCandidate, inst)
+end)
+
+local function watchCharacter()
+    local char = Me.Character
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    hum.Died:Connect(function()
+        print("[PumpkinAuto] Character died — collector paused")
+    end)
+end
+if Me.Character then watchCharacter() end
+Me.CharacterAdded:Connect(function(char)
+    w(0.5)
+    watchCharacter()
+    if automating then
+        print("[PumpkinAuto] Character respawned — resuming")
+    end
+end)
+
+-- ============================================================
+-- LOOPS
+-- ============================================================
+sp(function()
+    while gui.Parent do
+        w(CONFIG.scanInterval)
+        if running and automating then fullScan() end
+    end
+end)
+
+sp(function()
+    while gui.Parent do
+        w(0.5)
+        countLabel.Text = "Got: " .. collectedCount
+        local dotColor = GREY
+        if automating then
+            local hasActive = false
+            for _, rec in ipairs(foundOrder) do
+                if rec.isActive and not blacklist[rec.instance] then
+                    hasActive = true
+                    break
+                end
+            end
+            dotColor = hasActive and GREEN or YELLOW
+        else
+            dotColor = RED
+        end
+        dot.BackgroundColor3 = dotColor
+        miniDot.TextColor3 = dotColor
+        mds.Color = dotColor
+        stateLabel.Text = automating and "ON" or "OFF"
+        stateLabel.TextColor3 = automating and GREEN or GREY
+    end
+end)
+
+-- ============================================================
+-- BOOT
+-- ============================================================
+print("[PumpkinAuto] Loaded. Teleport-beside mode.")
+print("[PumpkinAuto] fireproximityprompt: " .. tostring(HAS_FIRE_PROMPT)
+    .. " | fireclickdetector: " .. tostring(HAS_FIRE_CLICK))
+print(string.format(
+    "[PumpkinAuto] Stand distance: 60%% of MaxActivationDistance, " ..
+    "clamped between %.1f studs and pumpkin radius + %d studs beyond",
+    CONFIG.standDistMin, CONFIG.standDistBuffer))
+
+if not HAS_FIRE_PROMPT and not HAS_FIRE_CLICK then
+    print("[PumpkinAuto] WARNING: no prompt-fire helper. Prompt fires will "
+        .. "use InputHoldBegin/End; ClickDetectors cannot fire without executor support.")
+end
+
+sp(fullScan)
+
+end)  -- end pcall
+
+if not bootOK then
+    local msg = "[PumpkinAuto] FATAL: " .. tostring(bootErr)
+    warn(msg)
+    print(msg)
+end
