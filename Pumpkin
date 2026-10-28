@@ -1,32 +1,31 @@
 --[[
-    PUMPKIN AUTO-COLLECTOR — Minimal Toggle UI (v5.2 beside-teleport)
-    ─────────────────────────────────────────────────────────────────
+    PUMPKIN AUTO-COLLECTOR — Minimal Toggle UI (v6 noclip + infinite retry)
+    ───────────────────────────────────────────────────────────────────────
     Same 220×62 widget. Single switch.
 
-    Key change: character teleports BESIDE the pumpkin (3-6 studs out),
-    not on top of it. The prompt then appears naturally within its own
-    MaxActivationDistance and fires cleanly.
+    NEW:
+      • Noclip during teleport — CanCollide=false on character parts
+        while moving to and firing the pumpkin, restored right after
+      • Accurate teleport — 12 offsets starting AT the pumpkin center,
+        only drifting outward on retries
+      • Infinite retry — each scanned pumpkin keeps retrying until
+        the prompt/click actually disappears (collected) or the
+        instance leaves the workspace (removed externally)
+      • Post-collect ground snap — after collecting, teleports to
+        ground below pumpkin, or back to original position if no
+        ground (protects against floating pumpkins)
 
-    • Stand distance = pumpkin radius + 3 studs (clamped inside prompt range)
-    • Ground raycast ensures you land on a valid surface
-    • Character faces the pumpkin (camera naturally shows prompt)
-    • 8 stand directions — rotated on each retry (handles walls/corners)
-    • No prompt property mutation — pure natural trigger
-    • Per-pumpkin blacklist after 3 failed attempts
-    • Auto-resumes after death/respawn
-
-    Requirements:
-      • Executor with fireproximityprompt (preferred) OR
-      • Executor with fireclickdetector (for ClickDetector pumpkins)
-      • Falls back to InputHoldBegin/End if neither exists
+    ⚠ Teleport + noclip will trip most anti-cheats. If the game kicks
+      you, turn auto OFF. This is a client-side bot.
 ]]
 
-print("[PumpkinAutoCollector v5.2] Loading...")
+print("[PumpkinAutoCollector v6] Loading...")
 
 local bootOK, bootErr = pcall(function()
 
 local Players     = game:GetService("Players")
 local UIS         = game:GetService("UserInputService")
+local RunService  = game:GetService("RunService")
 local TweenService= game:GetService("TweenService")
 local Me          = Players.LocalPlayer
 local PlayerGui   = Me:WaitForChild("PlayerGui", 20)
@@ -38,18 +37,31 @@ local CONFIG = {
     pumpkinPatterns = { "pumpkin", "pumkin", "jacko", "jack_o", "jack-o", "gourd" },
     promptPatterns  = { "collect", "grab", "pick", "harvest", "take", "pumpkin" },
 
-    -- Stand distance from pumpkin CENTER, in studs
-    standDistMin    = 3,        -- never closer than this
-    standDistFactor = 0.6,      -- percent of prompt MaxActivationDistance
-    standDistBuffer = 3,        -- extra studs beyond pumpkin radius
-    groundOffset    = 3,        -- HRP sits this far above ground
-
-    settleTime      = 0.30,
-    postFireWait    = 0.60,
-    delayBetween    = 0.7,
-    maxRetries      = 2,
+    settleTime      = 0.30,   -- after teleport, before fire
+    postFireWait    = 0.55,   -- after fire, before verify
+    delayBetween    = 0.4,    -- between pumpkins (retries handle their own wait)
+    retryBackoffMax = 4.0,    -- cap the retry wait
     scanInterval    = 3,
     batchSize       = 500,
+    groundOffset    = 3,      -- HRP sits this far above ground
+    groundSearchTop = 60,     -- raycast start height above pumpkin
+    groundSearchBot = 120,    -- raycast total downward distance
+}
+
+-- 12 teleport offsets — first is AT pumpkin, drift outward only on retries
+local TELEPORT_OFFSETS = {
+    Vector3.new(0, 0.5, 0),
+    Vector3.new(0, 1.5, 0),
+    Vector3.new(0.5, 1, 0),
+    Vector3.new(-0.5, 1, 0),
+    Vector3.new(0, 1, 0.5),
+    Vector3.new(0, 1, -0.5),
+    Vector3.new(0, 2, 0),
+    Vector3.new(1, 1, 0),
+    Vector3.new(-1, 1, 0),
+    Vector3.new(0, 1, 1),
+    Vector3.new(0, 1, -1),
+    Vector3.new(0, 3, 0),
 }
 
 -- ============================================================
@@ -58,9 +70,7 @@ local CONFIG = {
 local found          = {}
 local foundOrder     = {}
 local collectedCount = 0
-local failedAttempts = {}
 local attemptOffsets = {}
-local blacklist      = {}
 local automating     = false
 local running        = true
 local scanBusy       = false
@@ -68,6 +78,11 @@ local collectBusy    = false
 local connections    = {}
 local HAS_FIRE_PROMPT = (type(fireproximityprompt) == "function")
 local HAS_FIRE_CLICK  = (type(fireclickdetector) == "function")
+
+-- Noclip state
+local noclipActive = false
+local noclipOriginal = {}
+local noclipConn = nil
 
 local function w(t) return (task and task.wait or wait)(t) end
 local function sp(fn, ...) return (task and task.spawn or coroutine.wrap)(fn, ...) end
@@ -167,19 +182,74 @@ local function findClickDetector(inst)
     return nil
 end
 
--- ============================================================
--- PUMPKIN BOUNDS (position + size for stand distance)
--- ============================================================
 local function getPumpkinBounds(inst)
     if not inst or not inst.Parent then return nil, nil end
-    if inst:IsA("BasePart") then
-        return inst.Position, inst.Size
-    elseif inst:IsA("Model") then
+    if inst:IsA("BasePart") then return inst.Position, inst.Size end
+    if inst:IsA("Model") then
         local ok, cf, sz = pcall(function() return inst:GetBoundingBox() end)
         if ok and cf then return cf.Position, sz end
         return getPosition(inst), Vector3.new(2, 2, 2)
     end
     return getPosition(inst), Vector3.new(2, 2, 2)
+end
+
+-- ============================================================
+-- NOCLIP
+-- ============================================================
+local function enableNoclip()
+    if noclipActive then return end
+    local char = Me.Character
+    if not char then return end
+    noclipActive = true
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            noclipOriginal[part] = part.CanCollide
+            pcall(function() part.CanCollide = false end)
+        end
+    end
+    -- Re-enforce each frame in case anything re-enables collision
+    if not noclipConn then
+        noclipConn = RunService.Stepped:Connect(function()
+            if not noclipActive then return end
+            local c = Me.Character
+            if not c then return end
+            for _, part in ipairs(c:GetDescendants()) do
+                if part:IsA("BasePart") and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end)
+    end
+end
+
+local function disableNoclip()
+    if not noclipActive then return end
+    noclipActive = false
+    if noclipConn then noclipConn:Disconnect(); noclipConn = nil end
+    for part, orig in pairs(noclipOriginal) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = orig end)
+        end
+    end
+    noclipOriginal = {}
+end
+
+-- Safety: if script closes with noclip on
+local function forceNoclipOff() disableNoclip() end
+
+-- ============================================================
+-- GROUND FINDER
+-- ============================================================
+local function findGroundBelow(worldPos, character)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}
+    params.IgnoreWater = true
+    params.RespectCanCollide = true
+    local start = worldPos + Vector3.new(0, CONFIG.groundSearchTop, 0)
+    local hit = workspace:Raycast(start, Vector3.new(0, -CONFIG.groundSearchBot, 0), params)
+    if hit then return hit.Position end
+    return nil
 end
 
 -- ============================================================
@@ -222,8 +292,6 @@ local function processCandidate(inst)
         path      = pathOf(logTarget),
         position  = pos,
         isActive  = isActive,
-        hasPrompt = prompt ~= nil,
-        hasClick  = hasClick,
     }
     found[logTarget] = record
     table.insert(foundOrder, record)
@@ -246,7 +314,7 @@ local function fullScan()
 end
 
 -- ============================================================
--- CHARACTER + GROUND HELPERS
+-- CHARACTER HELPERS
 -- ============================================================
 local function getLocalCharacter()
     local char = Me.Character
@@ -258,102 +326,13 @@ local function getLocalCharacter()
     return char, hum, hrp
 end
 
-local function findGroundBelow(worldPos, character)
-    local params = RaycastParams.new()
-    params.FilterType = Enum.RaycastFilterType.Exclude
-    params.FilterDescendantsInstances = {character}
-    params.IgnoreWater = true
-    params.RespectCanCollide = true
-    local start = worldPos + Vector3.new(0, 30, 0)
-    local hit = workspace:Raycast(start, Vector3.new(0, -80, 0), params)
-    if hit then return hit.Position end
-    return nil
-end
-
 -- ============================================================
--- STAND DISTANCE / POSITION
--- ============================================================
-local STAND_DIRECTIONS = {
-    Vector3.new(1, 0, 0),
-    Vector3.new(-1, 0, 0),
-    Vector3.new(0, 0, 1),
-    Vector3.new(0, 0, -1),
-    Vector3.new(0.707, 0, 0.707),
-    Vector3.new(-0.707, 0, 0.707),
-    Vector3.new(0.707, 0, -0.707),
-    Vector3.new(-0.707, 0, -0.707),
-}
-
-local function computeStandDistance(prompt, pumpkinSize)
-    local maxAct = 10
-    if prompt then
-        pcall(function() maxAct = prompt.MaxActivationDistance or 10 end)
-    end
-    if not maxAct or maxAct < 2 then maxAct = 10 end
-
-    local pumpkinRadius = math.max(pumpkinSize.X, pumpkinSize.Z) / 2
-
-    if pumpkinRadius + 1 < maxAct * 0.9 then
-        -- Stand outside pumpkin, within activation range
-        local preferred = pumpkinRadius + CONFIG.standDistBuffer
-        local maxAllowed = maxAct * 0.85
-        return math.max(CONFIG.standDistMin, math.min(preferred, maxAllowed))
-    else
-        -- Pumpkin is nearly as big as the prompt's range → prioritize range
-        return math.max(1.5, maxAct * 0.7)
-    end
-end
-
-local function computeStandPosition(pumpkinPos, pumpkinSize, prompt, character, directionIndex)
-    local dist = computeStandDistance(prompt, pumpkinSize)
-    local dir = STAND_DIRECTIONS[((directionIndex - 1) % #STAND_DIRECTIONS) + 1]
-    local targetXZ = pumpkinPos + Vector3.new(dir.X, 0, dir.Z) * dist
-
-    local ground = findGroundBelow(targetXZ, character)
-    if ground then
-        return Vector3.new(ground.X, ground.Y + CONFIG.groundOffset, ground.Z)
-    end
-    return Vector3.new(targetXZ.X, pumpkinPos.Y + CONFIG.groundOffset, targetXZ.Z)
-end
-
-local function teleportBeside(inst, pumpkinPos, pumpkinSize, prompt)
-    local char, _, hrp = getLocalCharacter()
-    if not hrp then return false end
-
-    local idx = (attemptOffsets[inst] or 0) + 1
-    attemptOffsets[inst] = idx
-
-    local standPos = computeStandPosition(pumpkinPos, pumpkinSize, prompt, char, idx)
-    local lookAt = Vector3.new(pumpkinPos.X, standPos.Y, pumpkinPos.Z)
-
-    local ok = pcall(function()
-        hrp.CFrame = CFrame.lookAt(standPos, lookAt)
-        hrp.AssemblyLinearVelocity  = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-    end)
-    return ok
-end
-
-local function promptDistance(prompt)
-    if not prompt or not prompt.Parent then return nil end
-    local _, _, hrp = getLocalCharacter()
-    if not hrp then return nil end
-    local parent = prompt.Parent
-    local ppos
-    if parent:IsA("BasePart") then ppos = parent.Position
-    elseif parent:IsA("Model") then ppos = getPosition(parent)
-    elseif parent:IsA("Attachment") then ppos = parent.WorldPosition end
-    if not ppos then return nil end
-    return (ppos - hrp.Position).Magnitude
-end
-
--- ============================================================
--- FIRE (natural, no property boost)
+-- FIRE
 -- ============================================================
 local function firePrompt(prompt)
     if not prompt or not prompt.Parent then return false end
     if HAS_FIRE_PROMPT then
-        for i = 1, 3 do
+        for _ = 1, 3 do
             local ok = pcall(fireproximityprompt, prompt)
             if ok then return true end
             w(0.04)
@@ -370,7 +349,7 @@ end
 local function fireClick(cd)
     if not cd or not cd.Parent then return false end
     if HAS_FIRE_CLICK then
-        for i = 1, 3 do
+        for _ = 1, 3 do
             local ok = pcall(fireclickdetector, cd)
             if ok then return true end
             w(0.04)
@@ -380,15 +359,16 @@ local function fireClick(cd)
 end
 
 -- ============================================================
--- COLLECT ONE
+-- COLLECT ONE — accurate teleport + noclip
 -- ============================================================
 local function collectOne(rec)
     local inst = rec.instance
-    if not inst or not inst.Parent then return false, "gone", false end
+    if not inst or not inst.Parent then
+        return true, "gone", false  -- treat as collected
+    end
 
-    local pumpkinPos, pumpkinSize = getPumpkinBounds(inst)
+    local pumpkinPos = getPumpkinBounds(inst)
     if not pumpkinPos then return false, "no position", true end
-    if not pumpkinSize then pumpkinSize = Vector3.new(2, 2, 2) end
 
     local prompt = findActivePrompt(inst)
     local cd = findClickDetector(inst)
@@ -396,54 +376,95 @@ local function collectOne(rec)
         return true, "already gone", false
     end
 
-    -- Teleport beside pumpkin
-    if not teleportBeside(inst, pumpkinPos, pumpkinSize, prompt) then
-        return false, "no character", true
+    local char, _, hrp = getLocalCharacter()
+    if not char or not hrp then return false, "no character", true end
+
+    local returnCFrame = hrp.CFrame
+
+    -- Pick next offset (rotates through the 12)
+    local idx = (attemptOffsets[inst] or 0) + 1
+    attemptOffsets[inst] = idx
+    local offset = TELEPORT_OFFSETS[((idx - 1) % #TELEPORT_OFFSETS) + 1]
+
+    -- Enable noclip BEFORE teleport
+    enableNoclip()
+
+    -- Teleport to pumpkin + offset
+    local teleportOK = pcall(function()
+        hrp.CFrame = CFrame.new(pumpkinPos + offset)
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if not teleportOK then
+        disableNoclip()
+        return false, "teleport failed", true
     end
+
     w(CONFIG.settleTime)
 
     -- Re-check after landing
     prompt = findActivePrompt(inst)
     cd = findClickDetector(inst)
     if not prompt and not cd then
-        return true, "collected on arrive", false
-    end
-
-    -- Distance sanity check
-    if prompt then
-        local d = promptDistance(prompt)
-        local maxAct = 10
-        pcall(function() maxAct = prompt.MaxActivationDistance or 10 end)
-        if d and d > maxAct then
-            return false, string.format("too far (%.1f > %.1f)", d, maxAct), true
+        -- Already collected (maybe passive pickup on landing)
+        local ground = findGroundBelow(pumpkinPos, char)
+        if ground then
+            pcall(function()
+                hrp.CFrame = CFrame.new(ground + Vector3.new(0, CONFIG.groundOffset, 0))
+            end)
+        else
+            pcall(function() hrp.CFrame = returnCFrame end)
         end
+        disableNoclip()
+        return true, "collected on arrive", false
     end
 
     -- Fire
     local fired = false
     if prompt then fired = firePrompt(prompt) or fired end
     if cd and not fired then fired = fireClick(cd) or fired end
-    if not fired then return false, "fire failed", true end
+
     w(CONFIG.postFireWait)
 
     -- Verify
     local p2 = findActivePrompt(inst)
     local c2 = findClickDetector(inst)
-    if not p2 and not c2 then return true, "collected", false end
+    local success = not p2 and not c2
 
-    -- Follow-up fire
-    if p2 then firePrompt(p2) end
-    if c2 and not p2 then fireClick(c2) end
-    w(CONFIG.postFireWait)
-    p2 = findActivePrompt(inst)
-    c2 = findClickDetector(inst)
-    if not p2 and not c2 then return true, "collected (follow-up)", false end
+    -- One follow-up fire if still active
+    if not success then
+        if p2 then firePrompt(p2) end
+        if c2 and not p2 then fireClick(c2) end
+        w(CONFIG.postFireWait)
+        p2 = findActivePrompt(inst)
+        c2 = findClickDetector(inst)
+        success = not p2 and not c2
+    end
 
+    -- Post-collect position safety
+    if success then
+        local ground = findGroundBelow(pumpkinPos, char)
+        if ground then
+            pcall(function()
+                hrp.CFrame = CFrame.new(ground + Vector3.new(0, CONFIG.groundOffset, 0))
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end)
+        else
+            pcall(function()
+                hrp.CFrame = returnCFrame
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end)
+        end
+    end
+
+    disableNoclip()
+
+    if success then return true, "collected", false end
     return false, "still active", true
 end
 
 -- ============================================================
--- AUTO COLLECT LOOP
+-- AUTO-COLLECT LOOP (infinite retry per pumpkin)
 -- ============================================================
 local function getSortedActiveList()
     local char = Me.Character
@@ -452,7 +473,7 @@ local function getSortedActiveList()
     local list = {}
     for _, rec in ipairs(foundOrder) do
         local inst = rec.instance
-        if inst and inst.Parent and rec.isActive and not blacklist[inst] then
+        if inst and inst.Parent and rec.isActive then
             local pos = getPosition(inst) or rec.position
             if pos then
                 local d = myPos and (pos - myPos).Magnitude or 0
@@ -467,6 +488,7 @@ end
 local function autoCollectLoop()
     if collectBusy then return end
     collectBusy = true
+
     while automating and running do
         local char = getLocalCharacter()
         if not char then
@@ -480,26 +502,66 @@ local function autoCollectLoop()
                     if not automating or not running then break end
                     local rec = entry.rec
                     local inst = rec.instance
-                    if inst and inst.Parent and rec.isActive then
+                    if not inst or not inst.Parent or not rec.isActive then continue end
+
+                    -- ==========================================
+                    -- INFINITE RETRY until this pumpkin is collected
+                    -- ==========================================
+                    local attempts = 0
+                    while automating and running do
+                        -- Check if pumpkin disappeared (external collect)
+                        if not inst or not inst.Parent then
+                            collectedCount += 1
+                            rec.isActive = false
+                            print(string.format("[PumpkinAuto] ✓ %s (removed externally) · total: %d",
+                                rec.path, collectedCount))
+                            break
+                        end
+
+                        -- Bail out if auto was turned off mid-collection
+                        if not automating then break end
+
+                        attempts += 1
                         local ok, reason, stillActive = collectOne(rec)
+
                         if ok then
                             collectedCount += 1
                             rec.isActive = false
+                            attemptOffsets[inst] = nil
                             print(string.format("[PumpkinAuto] ✓ %s (%s) · total: %d",
                                 rec.path, reason, collectedCount))
-                        else
-                            failedAttempts[inst] = (failedAttempts[inst] or 0) + 1
-                            if failedAttempts[inst] >= CONFIG.maxRetries + 1 then
-                                blacklist[inst] = true
-                                print(string.format("[PumpkinAuto] ✗ Gave up after %d tries: %s (%s)",
-                                    failedAttempts[inst], rec.path, reason))
-                            else
-                                print(string.format("[PumpkinAuto] ✗ Retry %d/%d: %s (%s)",
-                                    failedAttempts[inst], CONFIG.maxRetries + 1,
-                                    rec.path, reason))
-                            end
-                            if not stillActive then rec.isActive = false end
+                            break
                         end
+
+                        if not stillActive then
+                            -- Prompt is truly gone but fire never confirmed
+                            collectedCount += 1
+                            rec.isActive = false
+                            print(string.format("[PumpkinAuto] ✓ %s (gone) · total: %d",
+                                rec.path, collectedCount))
+                            break
+                        end
+
+                        -- Escalating backoff capped at retryBackoffMax
+                        local backoff = math.min(
+                            CONFIG.retryBackoffMax,
+                            0.4 + math.floor(attempts / 3) * 0.4
+                        )
+                        print(string.format(
+                            "[PumpkinAuto] ✗ Attempt %d (%s) — retry in %.1fs · %s",
+                            attempts, tostring(reason), backoff, rec.path))
+
+                        if attempts == 15 then
+                            print("[PumpkinAuto] ⚠ 15+ attempts. This pumpkin may be uncollectible with current executor. Still retrying...")
+                        end
+
+                        w(backoff)
+                    end
+                    -- ==========================================
+                    -- End retry loop for this pumpkin
+                    -- ==========================================
+
+                    if automating and running then
                         w(CONFIG.delayBetween)
                     end
                 end
@@ -579,7 +641,7 @@ local function createToggleSwitch(parent, size, initialState, onChanged)
 end
 
 -- ============================================================
--- UI — WIDGET
+-- UI
 -- ============================================================
 local gui = Instance.new("ScreenGui")
 gui.Name = "PumpkinAutoCollector"
@@ -683,11 +745,12 @@ local toggle = createToggleSwitch(
     function(newState)
         automating = newState
         if newState then
-            print("[PumpkinAuto] AUTO ON — scanning + teleporting beside pumpkins")
+            print("[PumpkinAuto] AUTO ON — noclip teleport + infinite retry active")
             sp(fullScan)
             sp(autoCollectLoop)
         else
-            print("[PumpkinAuto] AUTO OFF")
+            print("[PumpkinAuto] AUTO OFF — restoring collisions")
+            disableNoclip()
         end
     end
 )
@@ -731,7 +794,6 @@ miniDot.Parent = gui
 local mdc = Instance.new("UICorner"); mdc.CornerRadius = UDim.new(1, 0); mdc.Parent = miniDot
 local mds = Instance.new("UIStroke"); mds.Color = BORDER; mds.Thickness = 1.5; mds.Parent = miniDot
 
--- Dragging
 local function makeDraggable(dragTarget, moveTarget, miniMode)
     local dragging, dragInput, dragStart, startPos = false, nil, nil, nil
     local moved = false
@@ -775,13 +837,11 @@ end)
 closeBtn.MouseButton1Click:Connect(function()
     running = false
     automating = false
+    forceNoclipOff()
     disconnectAll()
     gui:Destroy()
 end)
 
--- ============================================================
--- WATCHERS
--- ============================================================
 connect(workspace.DescendantAdded, function(inst)
     if not running then return end
     pcall(processCandidate, inst)
@@ -793,7 +853,8 @@ local function watchCharacter()
     local hum = char:FindFirstChildOfClass("Humanoid")
     if not hum then return end
     hum.Died:Connect(function()
-        print("[PumpkinAuto] Character died — collector paused")
+        print("[PumpkinAuto] Character died — restoring collisions")
+        forceNoclipOff()
     end)
 end
 if Me.Character then watchCharacter() end
@@ -805,9 +866,6 @@ Me.CharacterAdded:Connect(function(char)
     end
 end)
 
--- ============================================================
--- LOOPS
--- ============================================================
 sp(function()
     while gui.Parent do
         w(CONFIG.scanInterval)
@@ -823,10 +881,7 @@ sp(function()
         if automating then
             local hasActive = false
             for _, rec in ipairs(foundOrder) do
-                if rec.isActive and not blacklist[rec.instance] then
-                    hasActive = true
-                    break
-                end
+                if rec.isActive then hasActive = true; break end
             end
             dotColor = hasActive and GREEN or YELLOW
         else
@@ -840,16 +895,9 @@ sp(function()
     end
 end)
 
--- ============================================================
--- BOOT
--- ============================================================
-print("[PumpkinAuto] Loaded. Teleport-beside mode.")
+print("[PumpkinAuto] Loaded. Noclip teleport + infinite retry mode.")
 print("[PumpkinAuto] fireproximityprompt: " .. tostring(HAS_FIRE_PROMPT)
     .. " | fireclickdetector: " .. tostring(HAS_FIRE_CLICK))
-print(string.format(
-    "[PumpkinAuto] Stand distance: 60%% of MaxActivationDistance, " ..
-    "clamped between %.1f studs and pumpkin radius + %d studs beyond",
-    CONFIG.standDistMin, CONFIG.standDistBuffer))
 
 if not HAS_FIRE_PROMPT and not HAS_FIRE_CLICK then
     print("[PumpkinAuto] WARNING: no prompt-fire helper. Prompt fires will "
